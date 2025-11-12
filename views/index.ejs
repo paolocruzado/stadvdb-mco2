@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Title Basics</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+    th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+    th { background-color: #f0f0f0; }
+    button { padding: 10px 20px; font-size: 16px; }
+  </style>
+</head>
+<body>
+  <h1>Title Basics Overview</h1>
+  <button id="loadBtn">Load Titles from All Nodes</button>
+  <div id="results" style="margin-top:20px;"></div>
+
+  <script>
+    document.getElementById("loadBtn").addEventListener("click", async () => {
+      const resultsDiv = document.getElementById("results");
+      resultsDiv.innerHTML = "Loading...";
+
+      try {
+        const res = await fetch("/api/titles");
+        const data = await res.json();
+        let html = "";
+
+        data.nodes.forEach((node, i) => {
+          html += `<h2>Node ${i+1} - Total Rows: ${node.countRows}</h2>`;
+          html += `<h3>First 20 Rows</h3><table>
+            <thead><tr>
+              <th>tconst</th><th>Primary Title</th><th>Start Year</th>
+              <th>End Year</th><th>Runtime</th><th>Genres</th>
+            </tr></thead><tbody>`;
+          node.allRows.forEach(row => {
+            html += `<tr>
+              <td>${row.tconst}</td><td>${row.primaryTitle}</td><td>${row.startYear}</td>
+              <td>${row.endYear}</td><td>${row.runtimeMinutes}</td><td>${row.genres}</td>
+            </tr>`;
+          });
+          html += `</tbody></table>`;
+        });
+
+        resultsDiv.innerHTML = html;
+      } catch (err) {
+        resultsDiv.innerHTML = "Error loading data: " + err.message;
+      }
+    });
+  </script>
+</body>
+</html>
