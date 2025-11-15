@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  tunnel-node1:
+    build: ./docker
+    container_name: tunnel-node1
+    restart: always
+    environment:
+      SSH_HOST: ${SSH1_HOST}
+      SSH_PORT: ${SSH1_PORT}
+      SSH_USER: ${SSH1_USER}
+      SSH_PASS: ${SSH1_PASS}
+      LOCAL_PORT: ${DB1_PORT}
+      REMOTE_PORT: 3306
+    ports:
+      - "${DB1_PORT}:${DB1_PORT}"
+
+  tunnel-node2:
+    build: ./docker
+    container_name: tunnel-node2
+    restart: always
+    environment:
+      SSH_HOST: ${SSH2_HOST}
+      SSH_PORT: ${SSH2_PORT}
+      SSH_USER: ${SSH2_USER}
+      SSH_PASS: ${SSH2_PASS}
+      LOCAL_PORT: ${DB2_PORT}
+      REMOTE_PORT: 3306
+    ports:
+      - "${DB2_PORT}:${DB2_PORT}"
+
+  tunnel-node3:
+    build: ./docker
+    container_name: tunnel-node3
+    restart: always
+    environment:
+      SSH_HOST: ${SSH3_HOST}
+      SSH_PORT: ${SSH3_PORT}
+      SSH_USER: ${SSH3_USER}
+      SSH_PASS: ${SSH3_PASS}
+      LOCAL_PORT: ${DB3_PORT}
+      REMOTE_PORT: 3306
+    ports:
+      - "${DB3_PORT}:${DB3_PORT}"
