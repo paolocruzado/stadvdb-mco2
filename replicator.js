@@ -22,9 +22,6 @@ export default function setupReplicator(app, db1, db2, db3) {
 
     const updatedNodes = [];
 
-    await dbMap[origin].query(sql);
-    updatedNodes.push(origin);
-
     const targets = replicationMap[origin] || [];
     for (const target of targets) {
       await dbMap[target].query(sql);
