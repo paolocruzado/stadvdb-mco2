@@ -9,14 +9,6 @@ export default function distributedConcurrencyRoutes(db2, db3, replicator) {
     return txn;
   };
 
-  const replicateWrite = async (txn, node, sql) => {
-    if (txn.success) {
-      await replicator.runReplication(node, sql);
-      txn.logs.push(`[WRITE] ${node} replicated`);
-    }
-    return txn;
-  };
-
   router.post("/custom", async (req, res) => {
     const isolation = req.body.isolation || "READ COMMITTED";
     const transactions = req.body.transactions || [];
@@ -45,25 +37,18 @@ export default function distributedConcurrencyRoutes(db2, db3, replicator) {
               return `[READ ${node}] rows=${JSON.stringify(rows)}`;
             } else if (type === "write") {
               await c.query(sql);
-              return `[WRITE ${node}] executed`;
+              return { msg: `[WRITE ${node}] executed`, writeSql: sql };
             } else {
               return `[Transaction ${idx + 1}] Invalid type ${type}`;
             }
           },
         ];
 
-        let txnResult = await runTransaction(db, isolation, ops, `${node}-txn${idx + 1}`);
-        txnResult = normalizeLogs(txnResult);
-
-        if (type === "write") {
-          txnResult = await replicateWrite(txnResult, node, sql);
-        }
-
-        return txnResult;
+        const txnResult = await runTransaction(db, isolation, ops, `${node}-txn${idx + 1}`, replicator);
+        return normalizeLogs(txnResult);
       });
 
       const results = await Promise.all(txnPromises);
-
       res.json({ isolation, results });
     } catch (err) {
       console.error(err);

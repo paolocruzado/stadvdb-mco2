@@ -19,24 +19,11 @@ export default function concurrencyTestRoutes(db1, db2, db3, replicator) {
     return txn;
   };
 
-  const replicateWrite = async (txn, node, sql) => {
-    if (txn.success) {
-      await replicator.runReplication(node, sql);
-      txn.logs.push(`[WRITE] ${node} replicated`);
-    }
-    return txn;
-  };
-
   router.post("/runAllCases", async (req, res) => {
     const isolation = req.body.isolation || "READ COMMITTED";
     const scenario = req.body.scenario || "read-read";
 
-    const {
-      readNode2,
-      writeNode2,
-      readNode3,
-      writeNode3,
-    } = req.body.sql || {};
+    const { readNode2, writeNode2, readNode3, writeNode3 } = req.body.sql || {};
 
     const R2 = readNode2 || DEFAULTS.readNode2;
     const W2 = writeNode2 || DEFAULTS.writeNode2;
@@ -62,15 +49,16 @@ export default function concurrencyTestRoutes(db1, db2, db3, replicator) {
           ];
 
           const [r21, r22, r31, r32] = await Promise.all([
-            runTransaction(db2, isolation, readOps2, "Node2-r1"),
-            runTransaction(db2, isolation, readOps2, "Node2-r2"),
-            runTransaction(db3, isolation, readOps3, "Node3-r1"),
-            runTransaction(db3, isolation, readOps3, "Node3-r2"),
+            runTransaction(db2, isolation, readOps2, "Node2-r1", replicator),
+            runTransaction(db2, isolation, readOps2, "Node2-r2", replicator),
+            runTransaction(db3, isolation, readOps3, "Node3-r1", replicator),
+            runTransaction(db3, isolation, readOps3, "Node3-r2", replicator),
           ]);
 
           results["read-read"] = [r21, r22, r31, r32].map(normalizeLogs);
           break;
         }
+
         case "read-write": {
           const readOps2 = [
             async (c) => {
@@ -78,11 +66,10 @@ export default function concurrencyTestRoutes(db1, db2, db3, replicator) {
               return `[READ Node2] rows=${JSON.stringify(rows)}`;
             },
           ];
-
           const writeOps2 = [
             async (c) => {
               await c.query(W2);
-              return `[WRITE Node2]`;
+              return { msg: `[WRITE Node2] executed`, writeSql: W2 };
             },
           ];
 
@@ -92,61 +79,49 @@ export default function concurrencyTestRoutes(db1, db2, db3, replicator) {
               return `[READ Node3] rows=${JSON.stringify(rows)}`;
             },
           ];
-
           const writeOps3 = [
             async (c) => {
               await c.query(W3);
-              return `[WRITE Node3]`;
+              return { msg: `[WRITE Node3] executed`, writeSql: W3 };
             },
           ];
 
-          let [r2, w2, r3, w3] = await Promise.all([
-            runTransaction(db2, isolation, readOps2, "Node2-reader"),
-            runTransaction(db2, isolation, writeOps2, "Node2-writer"),
-            runTransaction(db3, isolation, readOps3, "Node3-reader"),
-            runTransaction(db3, isolation, writeOps3, "Node3-writer"),
+          const [r2, w2, r3, w3] = await Promise.all([
+            runTransaction(db2, isolation, readOps2, "Node2-reader", replicator),
+            runTransaction(db2, isolation, writeOps2, "Node2-writer", replicator),
+            runTransaction(db3, isolation, readOps3, "Node3-reader", replicator),
+            runTransaction(db3, isolation, writeOps3, "Node3-writer", replicator),
           ]);
 
-          [r2, w2, r3, w3].forEach(normalizeLogs);
-
-          w2 = await replicateWrite(w2, "node2", W2);
-          w3 = await replicateWrite(w3, "node3", W3);
-
-          results["read-write"] = [r2, w2, r3, w3];
+          results["read-write"] = [r2, w2, r3, w3].map(normalizeLogs);
           break;
         }
+
         case "write-write": {
           const writeOps2 = [
             async (c) => {
               await c.query(W2);
-              return `[WRITE Node2]`;
+              return { msg: `[WRITE Node2] executed`, writeSql: W2 };
             },
           ];
-
           const writeOps3 = [
             async (c) => {
               await c.query(W3);
-              return `[WRITE Node3]`;
+              return { msg: `[WRITE Node3] executed`, writeSql: W3 };
             },
           ];
 
-          let [w21, w22, w31, w32] = await Promise.all([
-            runTransaction(db2, isolation, writeOps2, "Node2-w1"),
-            runTransaction(db2, isolation, writeOps2, "Node2-w2"),
-            runTransaction(db3, isolation, writeOps3, "Node3-w1"),
-            runTransaction(db3, isolation, writeOps3, "Node3-w2"),
+          const [w21, w22, w31, w32] = await Promise.all([
+            runTransaction(db2, isolation, writeOps2, "Node2-w1", replicator),
+            runTransaction(db2, isolation, writeOps2, "Node2-w2", replicator),
+            runTransaction(db3, isolation, writeOps3, "Node3-w1", replicator),
+            runTransaction(db3, isolation, writeOps3, "Node3-w2", replicator),
           ]);
 
-          [w21, w22, w31, w32].forEach(normalizeLogs);
-
-          w21 = await replicateWrite(w21, "node2", W2);
-          w22 = await replicateWrite(w22, "node2", W2);
-          w31 = await replicateWrite(w31, "node3", W3);
-          w32 = await replicateWrite(w32, "node3", W3);
-
-          results["write-write"] = [w21, w22, w31, w32];
+          results["write-write"] = [w21, w22, w31, w32].map(normalizeLogs);
           break;
         }
+
         default:
           return res.status(400).json({ error: "Invalid scenario" });
       }

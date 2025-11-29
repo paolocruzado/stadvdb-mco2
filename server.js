@@ -7,6 +7,7 @@ import setupReplicator from "./replicator.js";
 import replicationRoutes from "./routes/replication.js";
 import concurrencyTestRoutes from "./routes/concurrencyTest.js";
 import distributedConcurrencyRoutes from "./routes/distributedConcurrencyRoutes.js";
+import crashRecoveryRoutes from "./routes/crashRecoveryRoutes.js";
 
 dotenv.config();
 
@@ -45,6 +46,7 @@ app.get("/", (req, res) => res.json({ ok: true }));
 app.use("/api", replicationRoutes(db1, db2, db3, replicator));
 app.use("/api/concurrencyTest", concurrencyTestRoutes(db1, db2, db3, replicator));
 app.use("/api/distributedConcurrency", distributedConcurrencyRoutes(db2, db3, replicator));
+app.use("/api/crashRecovery", crashRecoveryRoutes(db1, db2, db3, replicator));
 
 app.listen(process.env.PORT, () => {
   console.log(`Backend API running on port ${process.env.PORT}`);
