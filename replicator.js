@@ -3,132 +3,155 @@ import { v4 as uuidv4 } from "uuid";
 export default function setupReplicator(app, db1, db2, db3) {
   const dbMap = { node1: db1, node2: db2, node3: db3 };
 
-  // Node replication map (keys must match the transaction runner node names)
   const replicationMap = {
-    "node1": ["node2", "node3"],
-    "node2": ["node1"],
-    "node3": ["node1"],
+    node1: ["node2", "node3"],
+    node2: ["node1"],
+    node3: ["node1"],
   };
 
-  // --- Main replication function ---
-  async function runReplication(originNode, sql, replicationId = null, isolation = "READ COMMITTED") {
+  async function determineTargetNode(originNode, sql) {
+    const normalizedOrigin = originNode.toLowerCase().replace(/-.*/, "");
+
+    if (normalizedOrigin === "node1") {
+      const possibleTargets = replicationMap[normalizedOrigin] || [];
+
+      if (/INSERT/i.test(sql)) {
+        const match = sql.match(/VALUES\s*\(.*?(\d{4})/);
+        if (!match) throw new Error("Cannot determine startYear for routing");
+        const startYear = parseInt(match[1], 10);
+        return startYear <= 2010 ? "node2" : "node3";
+      } else {
+        const tconstMatch = sql.match(/WHERE\s+tconst\s*=\s*['"]([^'"]+)['"]/i);
+        if (!tconstMatch) throw new Error("Cannot determine tconst for routing");
+        const tconst = tconstMatch[1];
+
+        for (const target of possibleTargets) {
+          const db = dbMap[target];
+          const [rows] = await db.query(
+            "SELECT 1 FROM title_basics WHERE tconst = ? LIMIT 1",
+            [tconst]
+          );
+          if (rows.length > 0) return target;
+        }
+
+        throw new Error(`Cannot find target node for tconst ${tconst}`);
+      }
+    } else {
+      const targets = replicationMap[normalizedOrigin] || [];
+      if (targets.length === 0) throw new Error(`No target node defined for ${originNode}`);
+      return targets[0];
+    }
+  }
+
+  async function runReplication(originNode, sql, replicationId = null, isolation = "REPEATABLE READ", skipLogInsert = false) {
     if (!originNode || !sql) throw new Error("originNode and sql required");
+
+    const normalizedOrigin = originNode.toLowerCase().replace(/-.*/, "");
+    const originDb = dbMap[normalizedOrigin];
+    const target = await determineTargetNode(originNode, sql); // single target
+    const targetDb = dbMap[target];
     const repId = replicationId || uuidv4();
+    const logs = [];
 
-    // Normalize originNode key for mapping
-    let normalizedOrigin = originNode.toLowerCase().replace(/-.*/, ""); // "Node2-writer" → "node2"
+    if (!skipLogInsert) {
+      await originDb.query(
+        `INSERT INTO replication_log 
+          (id, origin_node, target_node, sql_text, status, attempts) 
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [repId, originNode, target, sql, "pending", 0]
+      );
+    }
 
-    const targets = replicationMap[normalizedOrigin] || [];
-    const updatedNodes = [];
+    try {
+      const [statusRow] = await targetDb.query(
+        "SELECT is_alive FROM node_status WHERE node_name = ?",
+        [target]
+      );
+      const isAlive = statusRow?.[0]?.is_alive ?? true;
 
-    for (const target of targets) {
-      const db = dbMap[target];
-      const logs = [];
-
-      try {
-        // Check if target node is alive
-        const [statusRow] = await db.query(
-          "SELECT is_alive FROM node_status WHERE node_name = ?",
-          [target]
+      if (!isAlive) {
+        logs.push(`[${target}] Node is down, replication deferred`);
+        await originDb.query(
+          `UPDATE replication_log 
+             SET attempts = attempts + 1, last_error = ?
+           WHERE id = ?`,
+          [`Target down: ${target}`, repId]
         );
-        const isAlive = statusRow?.[0]?.is_alive ?? true;
-
-        if (!isAlive) {
-          logs.push(`[${target}] ERROR: Node is down`);
-          await dbMap.node1.query(
-            `UPDATE replication_log SET status = 'failed', last_error = ? WHERE id = ?`,
-            ["Node is down", repId]
-          );
-          updatedNodes.push({ node: target, logs, error: "Node is down" });
-          continue;
-        }
-
-        // Apply SQL on target in transaction
-        const conn = await db.getConnection();
-        try {
-          await conn.query(`SET SESSION TRANSACTION ISOLATION LEVEL ${isolation}`);
-          logs.push(`[${target}] Isolation = ${isolation}`);
-
-          await conn.beginTransaction();
-          logs.push(`[${target}] BEGIN`);
-
-          await conn.query(sql);
-          logs.push(`[${target}] APPLY SQL: ${sql}`);
-
-          await conn.commit();
-          logs.push(`[${target}] COMMIT`);
-
-          // Mark replication as success
-          await dbMap.node1.query(
-            `UPDATE replication_log SET status = 'success', applied_at = NOW(), last_error = NULL WHERE id = ?`,
-            [repId]
-          );
-
-          updatedNodes.push({ node: target, logs });
-        } catch (err) {
-          logs.push(`[${target}] ERROR: ${err.message}`);
-          await conn.rollback();
-          logs.push(`[${target}] ROLLBACK`);
-
-          await dbMap.node1.query(
-            `UPDATE replication_log SET status = 'failed', last_error = ? WHERE id = ?`,
-            [err.message, repId]
-          );
-
-          updatedNodes.push({ node: target, logs, error: err.message });
-        } finally {
-          conn.release();
-        }
-      } catch (outerErr) {
-        logs.push(`[${target}] FATAL ERROR: ${outerErr.message}`);
-        updatedNodes.push({ node: target, logs, error: outerErr.message });
+        return { success: false, replicationId: repId, updatedNodes: [{ node: target, logs, error: "Node down" }] };
       }
-    }
 
-    return { success: true, replicationId: repId, updatedNodes, sqlExecuted: sql };
-  }
-
-  // --- Replay failed replications for a specific node ---
-  async function replayPendingReplications(targetNode) {
-    const [pending] = await dbMap.node1.query(
-      "SELECT * FROM replication_log WHERE target_node = ? AND status = 'failed' ORDER BY created_at ASC",
-      [targetNode]
-    );
-
-    for (const row of pending) {
+      const conn = await targetDb.getConnection();
       try {
-        await runReplication(row.origin_node, row.sql_text, row.id);
-        console.log(`[Replay] Applied pending replication ${row.id} to ${targetNode}`);
+        await conn.query(`SET SESSION TRANSACTION ISOLATION LEVEL ${isolation}`);
+        logs.push(`[${target}] Isolation = ${isolation}`);
+
+        await conn.beginTransaction();
+        logs.push(`[${target}] BEGIN`);
+
+        await conn.query(sql);
+        logs.push(`[${target}] APPLY SQL: ${sql}`);
+
+        await conn.commit();
+        logs.push(`[${target}] COMMIT`);
+
+        await originDb.query(
+          `UPDATE replication_log 
+             SET status = 'success', applied_at = NOW(), last_error = NULL 
+           WHERE id = ?`,
+          [repId]
+        );
+
+        return { success: true, replicationId: repId, updatedNodes: [{ node: target, logs }] };
+
       } catch (err) {
-        console.error(`[Replay] Failed replication ${row.id}: ${err.message}`);
+        await conn.rollback();
+        logs.push(`[${target}] ROLLBACK`);
+
+        await originDb.query(
+          `UPDATE replication_log 
+             SET attempts = attempts + 1, last_error = ?
+           WHERE id = ?`,
+          [err.message, repId]
+        );
+
+        return { success: false, replicationId: repId, updatedNodes: [{ node: target, logs, error: err.message }] };
+      } finally {
+        conn.release();
       }
+
+    } catch (outerErr) {
+      logs.push(`[${target}] FATAL ERROR: ${outerErr.message}`);
+      await originDb.query(
+        `UPDATE replication_log 
+           SET attempts = attempts + 1, last_error = ?
+         WHERE id = ?`,
+        [outerErr.message, repId]
+      );
+      return { success: false, replicationId: repId, updatedNodes: [{ node: target, logs, error: outerErr.message }] };
     }
   }
 
-  // --- API endpoints ---
-  app.post("/api/replicate", async (req, res) => {
-    try {
-      const { originNode, sql, replicationId, isolation } = req.body;
-      const result = await runReplication(originNode, sql, replicationId, isolation);
-      res.json(result);
-    } catch (err) {
-      console.error("Replication error:", err);
-      res.status(500).json({ error: err.message });
-    }
-  });
+  async function replayPendingReplications(targetNode) {
+    const normalizedTarget = targetNode.toLowerCase();
 
-  app.post("/api/replay/:node", async (req, res) => {
-    const targetNode = req.params.node.toLowerCase();
-    if (!dbMap[targetNode]) return res.status(400).json({ error: "Invalid node" });
+    for (const [originName, originDb] of Object.entries(dbMap)) {
+      const [pendingRows] = await originDb.query(
+        `SELECT * FROM replication_log 
+          WHERE target_node = ? AND status = 'pending'
+          ORDER BY created_at ASC`,
+        [normalizedTarget]
+      );
 
-    try {
-      await replayPendingReplications(targetNode);
-      res.json({ status: "replay triggered", targetNode });
-    } catch (err) {
-      console.error("Replay error:", err);
-      res.status(500).json({ error: err.message });
+      for (const row of pendingRows) {
+        try {
+          await runReplication(row.origin_node, row.sql_text, row.id, undefined, true);
+          console.log(`[Replay] Successfully replayed replication ${row.id} for ${targetNode}`);
+        } catch (err) {
+          console.error(`[Replay] Failed to replay replication ${row.id} for ${targetNode}: ${err.message}`);
+        }
+      }
     }
-  });
+  }
 
   return { runReplication, replayPendingReplications, dbMap };
 }
