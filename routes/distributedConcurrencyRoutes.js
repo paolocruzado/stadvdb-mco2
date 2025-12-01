@@ -30,21 +30,28 @@ export default function distributedConcurrencyRoutes(db2, db3, replicator) {
           return { logs: [`Transaction ${idx + 1}: Invalid node ${node}`], success: false };
         }
 
+        // --- FIX: Define Operations as Data Objects ---
+        // Instead of passing a function, we pass the SQL and metadata directly.
+        const opType = type.toUpperCase(); // Ensure "READ" or "WRITE"
+        
         const ops = [
-          async (c) => {
-            if (type === "read") {
-              const [rows] = await c.query(sql);
-              return `[READ ${node}] rows=${JSON.stringify(rows)}`;
-            } else if (type === "write") {
-              await c.query(sql);
-              return { msg: `[WRITE ${node}] executed`, writeSql: sql };
-            } else {
-              return `[Transaction ${idx + 1}] Invalid type ${type}`;
-            }
-          },
+          {
+            sql: sql,
+            type: opType,
+            // logMsg is optional, the runner adds standard logging, 
+            // but we can add specific context if needed.
+            logMsg: `Executing ${opType} on ${node}` 
+          }
         ];
 
-        const txnResult = await runTransaction(db, isolation, ops, `${node}-txn${idx + 1}`, replicator);
+        const txnResult = await runTransaction(
+            db, 
+            isolation, 
+            ops, 
+            `${node}-txn${idx + 1}`, 
+            replicator
+        );
+        
         return normalizeLogs(txnResult);
       });
 

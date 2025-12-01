@@ -35,17 +35,12 @@ export default function concurrencyTestRoutes(db1, db2, db3, replicator) {
     try {
       switch (scenario) {
         case "read-read": {
+          // Define operations as data objects
           const readOps2 = [
-            async (c) => {
-              const [rows] = await c.query(R2);
-              return `[READ Node2] rows=${JSON.stringify(rows)}`;
-            },
+            { sql: R2, type: 'READ', logMsg: 'Reading Node2' }
           ];
           const readOps3 = [
-            async (c) => {
-              const [rows] = await c.query(R3);
-              return `[READ Node3] rows=${JSON.stringify(rows)}`;
-            },
+            { sql: R3, type: 'READ', logMsg: 'Reading Node3' }
           ];
 
           const [r21, r22, r31, r32] = await Promise.all([
@@ -61,29 +56,17 @@ export default function concurrencyTestRoutes(db1, db2, db3, replicator) {
 
         case "read-write": {
           const readOps2 = [
-            async (c) => {
-              const [rows] = await c.query(R2);
-              return `[READ Node2] rows=${JSON.stringify(rows)}`;
-            },
+            { sql: R2, type: 'READ', logMsg: 'Reading Node2' }
           ];
           const writeOps2 = [
-            async (c) => {
-              await c.query(W2);
-              return { msg: `[WRITE Node2] executed`, writeSql: W2 };
-            },
+            { sql: W2, type: 'WRITE', logMsg: 'Writing Node2' }
           ];
 
           const readOps3 = [
-            async (c) => {
-              const [rows] = await c.query(R3);
-              return `[READ Node3] rows=${JSON.stringify(rows)}`;
-            },
+            { sql: R3, type: 'READ', logMsg: 'Reading Node3' }
           ];
           const writeOps3 = [
-            async (c) => {
-              await c.query(W3);
-              return { msg: `[WRITE Node3] executed`, writeSql: W3 };
-            },
+            { sql: W3, type: 'WRITE', logMsg: 'Writing Node3' }
           ];
 
           const [r2, w2, r3, w3] = await Promise.all([
@@ -99,16 +82,10 @@ export default function concurrencyTestRoutes(db1, db2, db3, replicator) {
 
         case "write-write": {
           const writeOps2 = [
-            async (c) => {
-              await c.query(W2);
-              return { msg: `[WRITE Node2] executed`, writeSql: W2 };
-            },
+            { sql: W2, type: 'WRITE', logMsg: 'Writing Node2' }
           ];
           const writeOps3 = [
-            async (c) => {
-              await c.query(W3);
-              return { msg: `[WRITE Node3] executed`, writeSql: W3 };
-            },
+            { sql: W3, type: 'WRITE', logMsg: 'Writing Node3' }
           ];
 
           const [w21, w22, w31, w32] = await Promise.all([

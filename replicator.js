@@ -16,7 +16,12 @@ export default function setupReplicator(app, db1, db2, db3) {
       const possibleTargets = replicationMap[normalizedOrigin] || [];
 
       if (/INSERT/i.test(sql)) {
-        const match = sql.match(/VALUES\s*\(.*?(\d{4})/);
+        // --- FIX STARTS HERE ---
+        // Old Regex was too eager and grabbed '0000' from 'tt0000001'
+        // New Regex skips the first two arguments ('tconst', 'title') to find the year
+        const match = sql.match(/VALUES\s*\(\s*'[^']*'\s*,\s*'[^']*'\s*,\s*'?(\d+)'?/i);
+        // --- FIX ENDS HERE ---
+
         if (!match) throw new Error("Cannot determine startYear for routing");
         const startYear = parseInt(match[1], 10);
         return startYear <= 2010 ? "node2" : "node3";
@@ -25,13 +30,20 @@ export default function setupReplicator(app, db1, db2, db3) {
         if (!tconstMatch) throw new Error("Cannot determine tconst for routing");
         const tconst = tconstMatch[1];
 
+        // Check which node actually has this record
         for (const target of possibleTargets) {
           const db = dbMap[target];
-          const [rows] = await db.query(
-            "SELECT 1 FROM title_basics WHERE tconst = ? LIMIT 1",
-            [tconst]
-          );
-          if (rows.length > 0) return target;
+          // We need to check if the node is reachable/alive before querying or try/catch it
+          try {
+             const [rows] = await db.query(
+               "SELECT 1 FROM title_basics WHERE tconst = ? LIMIT 1",
+               [tconst]
+             );
+             if (rows.length > 0) return target;
+          } catch (err) {
+             console.warn(`[Replicator] Could not check ${target} for tconst: ${err.message}`);
+             continue; 
+          }
         }
 
         throw new Error(`Cannot find target node for tconst ${tconst}`);
@@ -48,7 +60,10 @@ export default function setupReplicator(app, db1, db2, db3) {
 
     const normalizedOrigin = originNode.toLowerCase().replace(/-.*/, "");
     const originDb = dbMap[normalizedOrigin];
-    const target = await determineTargetNode(originNode, sql); // single target
+    
+    // This will now correctly return just ONE target (or throw), preventing duplicate log entries
+    const target = await determineTargetNode(originNode, sql);
+    
     const targetDb = dbMap[target];
     const repId = replicationId || uuidv4();
     const logs = [];
@@ -131,27 +146,5 @@ export default function setupReplicator(app, db1, db2, db3) {
     }
   }
 
-  async function replayPendingReplications(targetNode) {
-    const normalizedTarget = targetNode.toLowerCase();
-
-    for (const [originName, originDb] of Object.entries(dbMap)) {
-      const [pendingRows] = await originDb.query(
-        `SELECT * FROM replication_log 
-          WHERE target_node = ? AND status = 'pending'
-          ORDER BY created_at ASC`,
-        [normalizedTarget]
-      );
-
-      for (const row of pendingRows) {
-        try {
-          await runReplication(row.origin_node, row.sql_text, row.id, undefined, true);
-          console.log(`[Replay] Successfully replayed replication ${row.id} for ${targetNode}`);
-        } catch (err) {
-          console.error(`[Replay] Failed to replay replication ${row.id} for ${targetNode}: ${err.message}`);
-        }
-      }
-    }
-  }
-
-  return { runReplication, replayPendingReplications, dbMap };
+  return { runReplication, dbMap };
 }

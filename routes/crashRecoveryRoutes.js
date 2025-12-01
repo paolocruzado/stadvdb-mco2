@@ -19,8 +19,8 @@ export default function crashRecoveryRoutes(db1, db2, db3, replicator) {
 
     for (const [originName, originDb] of Object.entries(dbMap)) {
       const [pendingRows] = await originDb.query(
-        `SELECT * FROM replication_log
-          WHERE target_node = ? AND status = 'pending'
+        `SELECT * FROM replication_log 
+          WHERE target_node = ? AND status = 'pending' 
           ORDER BY created_at ASC`,
         [normalizedTarget]
       );
@@ -41,8 +41,8 @@ export default function crashRecoveryRoutes(db1, db2, db3, replicator) {
 
           if (allSucceeded) {
             await originDb.query(
-              `UPDATE replication_log
-                SET status = 'success', applied_at = NOW(), last_error = NULL
+              `UPDATE replication_log 
+                SET status = 'success', applied_at = NOW(), last_error = NULL 
               WHERE id = ?`,
               [row.id]
             );
@@ -53,8 +53,8 @@ export default function crashRecoveryRoutes(db1, db2, db3, replicator) {
               .map(u => u.node)
               .join(", ");
             await originDb.query(
-              `UPDATE replication_log
-                SET attempts = attempts + 1, last_error = ?
+              `UPDATE replication_log 
+                SET attempts = attempts + 1, last_error = ? 
               WHERE id = ?`,
               [`Failed nodes: ${failedNodes}`, row.id]
             );
@@ -63,8 +63,8 @@ export default function crashRecoveryRoutes(db1, db2, db3, replicator) {
         } catch (err) {
           console.error(`[Replay] Fatal error for ${row.id}: ${err.message}`);
           await originDb.query(
-            `UPDATE replication_log
-              SET attempts = attempts + 1, last_error = ?
+            `UPDATE replication_log 
+              SET attempts = attempts + 1, last_error = ? 
             WHERE id = ?`,
             [err.message, row.id]
           );
@@ -111,11 +111,15 @@ export default function crashRecoveryRoutes(db1, db2, db3, replicator) {
     if (!db) return res.status(400).json({ error: "Invalid node" });
 
     try {
+      // --- FIX: Define Operations as Data Objects ---
+      // We assume this is a WRITE because the original code returned 'writeSql'
+      // which triggers the replication logic in runTransaction.
       const ops = [
-        async (conn) => {
-          await conn.query(sql);
-          return { msg: `Executed SQL on ${node}`, writeSql: sql };
-        },
+        {
+          sql: sql,
+          type: 'WRITE',
+          logMsg: `Executed SQL on ${node}`
+        }
       ];
 
       const txnResult = await runTransaction(
