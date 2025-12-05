@@ -16,6 +16,7 @@ export async function runTransaction(db, isolation, operations, nodeName, replic
     // 1. Set Isolation
     await conn.query(`SET SESSION TRANSACTION ISOLATION LEVEL ${isolation}`);
     logs.push(`[${nodeName}] Isolation = ${isolation}`);
+    console.log(`[${nodeName}] Isolation = ${isolation}`);
 
     // 2. Start Transaction
     await conn.beginTransaction();

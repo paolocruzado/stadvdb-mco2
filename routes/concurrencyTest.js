@@ -70,10 +70,10 @@ export default function concurrencyTestRoutes(db1, db2, db3, replicator) {
           ];
 
           const [r2, w2, r3, w3] = await Promise.all([
-            runTransaction(db2, isolation, readOps2, "Node2-reader", replicator),
             runTransaction(db2, isolation, writeOps2, "Node2-writer", replicator),
-            runTransaction(db3, isolation, readOps3, "Node3-reader", replicator),
+            runTransaction(db2, isolation, readOps2, "Node2-reader", replicator),
             runTransaction(db3, isolation, writeOps3, "Node3-writer", replicator),
+            runTransaction(db3, isolation, readOps3, "Node3-reader", replicator),
           ]);
 
           results["read-write"] = [r2, w2, r3, w3].map(normalizeLogs);
