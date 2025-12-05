@@ -1,22 +1,18 @@
 import express from "express";
-import mysql from "mysql2"; // Import mysql2 to format params
+import mysql from "mysql2"; 
 import { runTransaction } from "../transactionRunner.js";
-import { LockManager } from "../lockmanager.js"; // Import LockManager
+import { LockManager } from "../lockmanager.js"; 
 
 export default function webApplicationRoutes(db1, db2, db3, replicator) {
   const router = express.Router();
   
-  // Initialize LockManager on Node 1 (Master)
-  // We use Node 1 because locks require WRITE operations (INSERT/DELETE)
   const lockManager = new LockManager(db1);
 
-  // Normalize logs helper
   const normalizeLogs = (txn) => {
     txn.logs = Array.isArray(txn.logs) ? txn.logs : [txn.logs || ""];
     return txn;
   };
 
-  // Helper to throw detailed error if transaction failed
   const checkTxnSuccess = (txnResult) => {
     if (!txnResult.success) {
       const errorLog = txnResult.logs.find(l => typeof l === 'string' && l.includes('ERROR'));
@@ -25,13 +21,65 @@ export default function webApplicationRoutes(db1, db2, db3, replicator) {
     return txnResult;
   };
 
-  // -------------------------
-  // 1️⃣ Add Movie (Using Distributed Lock)
-  // -------------------------
+  // Helper: Check if db1 is alive, if not determine failover node based on startYear
+  const getActiveDbForWrite = async (startYear = null) => {
+    try {
+      const [statusRow] = await db1.query(
+        "SELECT is_alive FROM node_status WHERE node_name = 'node1'"
+      );
+      const isAlive = statusRow?.[0]?.is_alive ?? true;
+      
+      if (isAlive) {
+        return { db: db1, node: "node1" };
+      }
+    } catch (err) {
+      console.warn("[Failover] Could not check node1 status:", err.message);
+    }
+
+    // db1 is down, determine which replica to use based on startYear
+    if (startYear !== null) {
+      const targetNode = startYear <= 2010 ? "node2" : "node3";
+      const targetDb = targetNode === "node2" ? db2 : db3;
+      console.log(`[Failover] db1 is down, routing to ${targetNode} based on startYear=${startYear}`);
+      return { db: targetDb, node: targetNode };
+    }
+
+    // If no startYear provided, try node2 first (default fallback)
+    console.log("[Failover] db1 is down, defaulting to node2");
+    return { db: db2, node: "node2" };
+  };
+
+  // Helper: Get active DB for read operations, with failover
+  const getActiveDbForRead = async (preferredNodes = ["node2", "node3"]) => {
+    const candidates = [];
+    
+    // Check preferred nodes first
+    for (const nodeName of preferredNodes) {
+      try {
+        const db = nodeName === "node2" ? db2 : nodeName === "node3" ? db3 : db1;
+        const [statusRow] = await db.query(
+          "SELECT is_alive FROM node_status WHERE node_name = ?",
+          [nodeName]
+        );
+        const isAlive = statusRow?.[0]?.is_alive ?? true;
+        
+        if (isAlive) {
+          console.log(`[Read Failover] Using ${nodeName}`);
+          return { db, node: nodeName };
+        }
+      } catch (err) {
+        console.warn(`[Read Failover] Could not check ${nodeName}:`, err.message);
+      }
+    }
+
+    // All preferred nodes down, fallback to node1
+    console.log("[Read Failover] Preferred nodes down, falling back to node1");
+    return { db: db1, node: "node1" };
+  };
+
   router.post("/addMovie", async (req, res) => {
     const { title, startYear, runtimeMinutes, genres, isolation } = req.body;
     
-    // Validate required fields
     if (!title || !startYear) {
         return res.status(400).json({ error: "Title and Start Year are required" });
     }
@@ -40,29 +88,26 @@ export default function webApplicationRoutes(db1, db2, db3, replicator) {
     let lockAcquired = false;
 
     try {
-      // 1. ACQUIRE LOCK (Waits if busy)
-      // This prevents race conditions at the application level
-      await lockManager.acquire(LOCK_KEY, "node1");
+      // Use failover logic to determine which node to write to
+      const { db: targetDb, node: targetNode } = await getActiveDbForWrite(startYear);
+      
+      await lockManager.acquire(LOCK_KEY, targetNode);
       lockAcquired = true;
 
-      // 2. READ MAX ID (Safe to do now because we have the lock)
-      // We read directly from db1 before starting the transaction runner
-      const [rows] = await db1.query(
+      const [rows] = await targetDb.query(
         "SELECT tconst FROM title_basics ORDER BY LENGTH(tconst) DESC, tconst DESC LIMIT 1"
       );
       
-      let nextId = "tt0000001"; // Default if table is empty
+      let nextId = "tt0000001";
       
       if (rows.length > 0) {
         const lastId = rows[0].tconst;
         const numPart = parseInt(lastId.replace("tt", ""), 10);
         if (!isNaN(numPart)) {
-            // Increment and pad with zeros
             nextId = `tt${String(numPart + 1).padStart(7, "0")}`;
         }
       }
 
-      // 3. PREPARE SQL
       const insertSql = `
         INSERT INTO title_basics (tconst, primaryTitle, startYear, runtimeMinutes, genres)
         VALUES (?, ?, ?, ?, ?)
@@ -70,9 +115,6 @@ export default function webApplicationRoutes(db1, db2, db3, replicator) {
       const params = [nextId, title, startYear, runtimeMinutes || null, genres || null];
       const formattedSql = mysql.format(insertSql, params);
 
-      // 4. RUN TRANSACTION
-      // Now we call the runner to execute the insert. 
-      // We pass the fully formatted SQL so the runner handles the DB transaction and replication.
       const ops = [
         {
           sql: formattedSql,
@@ -82,10 +124,10 @@ export default function webApplicationRoutes(db1, db2, db3, replicator) {
       ];
 
       const txnResult = await runTransaction(
-        db1, // Always write to Master
+        targetDb, 
         isolation || "REPEATABLE READ",
         ops,
-        "node1", // Strict node name for Replicator
+        targetNode,
         replicator
       );
 
@@ -95,40 +137,70 @@ export default function webApplicationRoutes(db1, db2, db3, replicator) {
       console.error(err);
       res.status(500).json({ error: err.message });
     } finally {
-      // 5. RELEASE LOCK (Always runs)
       if (lockAcquired) {
         await lockManager.release(LOCK_KEY);
       }
     }
   });
 
-  // -------------------------
-  // 3️⃣ Update Record
-  // -------------------------
   router.post("/update", async (req, res) => {
     const { isolation, sql } = req.body;
-    // sql expected structure: { query: string, params: any[] }
     if (!sql || !sql.query) return res.status(400).json({ error: "Missing SQL" });
 
-    const db = db1; // ALWAYS node1 for writes
-
     try {
-      // Manually format the SQL + Params into one string
+      // Extract tconst from WHERE clause to determine target node's startYear
+      const tconstMatch = sql.query.match(/WHERE\s+tconst\s*=\s*['"]?([^'"]+)['"]?/i);
+      let startYear = null;
+      
+      if (tconstMatch) {
+        const tconst = tconstMatch[1];
+        // Query db1 first for startYear, if down query replicas
+        try {
+          const [rows] = await db1.query(
+            "SELECT startYear FROM title_basics WHERE tconst = ?",
+            [tconst]
+          );
+          if (rows.length > 0) {
+            startYear = rows[0].startYear;
+          }
+        } catch (err) {
+          console.warn("[Update] Could not query db1 for startYear:", err.message);
+          // Try replicas
+          for (const db of [db2, db3]) {
+            try {
+              const [rows] = await db.query(
+                "SELECT startYear FROM title_basics WHERE tconst = ?",
+                [tconst]
+              );
+              if (rows.length > 0) {
+                startYear = rows[0].startYear;
+                break;
+              }
+            } catch (e) {
+              continue;
+            }
+          }
+        }
+      }
+
+      // Use failover logic to determine which node to write to
+      const { db: targetDb, node: targetNode } = await getActiveDbForWrite(startYear);
+
       const formattedSql = mysql.format(sql.query, sql.params || []);
 
       const ops = [
         {
           sql: formattedSql,
           type: 'WRITE',
-          logMsg: '[UPDATE] Executed on node1'
+          logMsg: `[UPDATE] Executed on ${targetNode}`
         }
       ];
 
       const txnResult = await runTransaction(
-        db,
-        isolation || "READ COMMITTED",
+        targetDb,
+        isolation || "REPEATABLE READ",
         ops,
-        "node1", // FIX: Must be "node1" so replicator knows the source is the Master
+        targetNode,
         replicator
       );
 
@@ -140,9 +212,6 @@ export default function webApplicationRoutes(db1, db2, db3, replicator) {
     }
   });
 
-  // -------------------------
-  // 4️⃣ Search/View Records
-  // -------------------------
   router.get("/search", async (req, res) => {
     const { title, genre, minRuntime, maxRuntime, startYear } = req.query;
 
@@ -174,7 +243,6 @@ export default function webApplicationRoutes(db1, db2, db3, replicator) {
     const rawSql = `SELECT tconst, primaryTitle, startYear, runtimeMinutes, genres
                     FROM title_basics ${whereClause} LIMIT 100`;
 
-    // 1. COMBINE SQL AND PARAMS HERE
     const finalSql = mysql.format(rawSql, params);
 
     console.log("Search SQL (Formatted):", finalSql);
@@ -182,39 +250,69 @@ export default function webApplicationRoutes(db1, db2, db3, replicator) {
     try {
       let results = [];
 
-      // 2. Pass the combined 'finalSql' to the runner
       const readOp = {
         sql: finalSql,
         type: 'READ',
         logMsg: 'Search Query'
       };
 
-      // --- UPDATED LOGIC: SEARCH ONLY NODE 2 AND NODE 3 ---
-      // We explicitly exclude Node 1 (Master) to enforce read-replica architecture.
-      // We search both Node 2 and Node 3 and merge results (Scatter-Gather).
-      const txnResults = await Promise.all([db2, db3].map(async (db, idx) => {
-        // Safe check: if a db connection isn't available, skip it
-        if (!db) return [];
+      // Check if BOTH node2 and node3 are alive
+      let node2Alive = false;
+      let node3Alive = false;
 
-        const nodeName = `node${idx + 2}`; // idx 0 -> node2, idx 1 -> node3
-
-        const txnResult = await runTransaction(
-          db,
-          "REPEATABLE READ",
-          [readOp],
-          `search-${nodeName}`,
-          replicator
+      try {
+        const [statusRow] = await db2.query(
+          "SELECT is_alive FROM node_status WHERE node_name = 'node2'"
         );
+        node2Alive = statusRow?.[0]?.is_alive ?? true;
+      } catch (err) {
+        console.warn("[Search] Could not check node2 status:", err.message);
+      }
 
-        if (!txnResult.success) {
-          console.error(`Search failed on ${nodeName}:`, txnResult.logs);
+      try {
+        const [statusRow] = await db3.query(
+          "SELECT is_alive FROM node_status WHERE node_name = 'node3'"
+        );
+        node3Alive = statusRow?.[0]?.is_alive ?? true;
+      } catch (err) {
+        console.warn("[Search] Could not check node3 status:", err.message);
+      }
+
+      let nodesToQuery = [];
+      if (node2Alive && node3Alive) {
+        // Both alive, query both
+        nodesToQuery = [
+          { db: db2, node: "node2" },
+          { db: db3, node: "node3" }
+        ];
+      } else if (!node2Alive || !node3Alive) {
+        // Either down, fallback to node1
+        console.log("[Search] Either node2 or node3 are down, falling back to node1");
+        nodesToQuery = [{ db: db1, node: "node1" }];
+      }
+
+      const txnResults = await Promise.all(nodesToQuery.map(async ({ db, node }) => {
+        try {
+          const txnResult = await runTransaction(
+            db,
+            "REPEATABLE READ",
+            [readOp],
+            `search-${node}`,
+            replicator
+          );
+
+          if (!txnResult.success) {
+            console.error(`Search failed on ${node}:`, txnResult.logs);
+            return [];
+          }
+
+          return txnResult.logs.filter(r => r.rows).flatMap(r => r.rows);
+        } catch (err) {
+          console.error(`Search exception on ${node}:`, err.message);
           return [];
         }
-
-        return txnResult.logs.filter(r => r.rows).flatMap(r => r.rows);
       }));
 
-      // Combine and remove duplicates based on tconst
       const merged = {};
       txnResults.flat().forEach(r => merged[r.tconst] = r);
       results = Object.values(merged);
@@ -226,9 +324,6 @@ export default function webApplicationRoutes(db1, db2, db3, replicator) {
     }
   });
 
-  // -------------------------
-  // 5️⃣ Reports (text-based)
-  // -------------------------
   router.get("/reports", async (req, res) => {
     const runOnNode = async (db, nodeName) => {
       const sql = `
@@ -258,10 +353,74 @@ export default function webApplicationRoutes(db1, db2, db3, replicator) {
     };
 
     try {
-      const [node2Stats, node3Stats] = await Promise.all([
-        runOnNode(db2, "node2"),
-        runOnNode(db3, "node3"),
-      ]);
+      // Check if BOTH node2 and node3 are alive
+      let node2Alive = false;
+      let node3Alive = false;
+
+      try {
+        const [statusRow] = await db2.query(
+          "SELECT is_alive FROM node_status WHERE node_name = 'node2'"
+        );
+        node2Alive = statusRow?.[0]?.is_alive ?? true;
+      } catch (err) {
+        console.warn("[Reports] Could not check node2 status:", err.message);
+      }
+
+      try {
+        const [statusRow] = await db3.query(
+          "SELECT is_alive FROM node_status WHERE node_name = 'node3'"
+        );
+        node3Alive = statusRow?.[0]?.is_alive ?? true;
+      } catch (err) {
+        console.warn("[Reports] Could not check node3 status:", err.message);
+      }
+
+      // Determine which nodes to query
+      let nodesToQuery = [];
+      if (node2Alive && node3Alive) {
+        // Both alive, query both
+        nodesToQuery = ["node2", "node3"];
+      } else if (!node2Alive || !node3Alive) {
+        // Both down, fallback to node1
+        console.log("[Reports] Either node2 or node3 are down, falling back to node1");
+        nodesToQuery = ["node1"];
+      } 
+      const nodeStats = [];
+      
+      for (const nodeName of nodesToQuery) {
+        const db = nodeName === "node2" ? db2 : nodeName === "node3" ? db3 : db1;
+        
+        const sql = `
+          SELECT 
+            FLOOR(startYear / 10) * 10 AS decade,
+            COUNT(*) AS count,
+            AVG(runtimeMinutes) AS avgRuntime
+          FROM title_basics
+          GROUP BY decade
+          ORDER BY decade
+        `;
+
+        try {
+          const txnResult = await runTransaction(
+            db,
+            "REPEATABLE READ",
+            [{ sql: sql, type: 'READ', logMsg: 'Report Stats' }],
+            `${nodeName}-reports`,
+            replicator
+          );
+
+          if (!txnResult.success) {
+            console.error(`Report failed on ${nodeName}:`, txnResult.logs);
+            nodeStats.push([]);
+          } else {
+            const stats = txnResult.logs.find(r => r.rows)?.rows || [];
+            nodeStats.push(stats);
+          }
+        } catch (err) {
+          console.error(`Report exception on ${nodeName}:`, err.message);
+          nodeStats.push([]);
+        }
+      }
 
       const merged = {};
 
@@ -284,8 +443,9 @@ export default function webApplicationRoutes(db1, db2, db3, replicator) {
         }
       };
 
-      pushStats(node2Stats);
-      pushStats(node3Stats);
+      for (const stats of nodeStats) {
+        pushStats(stats);
+      }
 
       const finalMerged = Object.values(merged)
         .map(d => ({
@@ -309,37 +469,32 @@ export default function webApplicationRoutes(db1, db2, db3, replicator) {
   router.post("/delete", async (req, res) => {
     const { tconst, isolation } = req.body;
     
-    // 1. Validation
     if (!tconst) {
         return res.status(400).json({ error: "tconst is required for deletion" });
     }
 
-    const db = db1; // Writes/Deletes go to Master (Node 1)
+    const db = db1; 
 
     try {
-      // 2. Format SQL safely
       const deleteSql = "DELETE FROM title_basics WHERE tconst = ?";
       const formattedSql = mysql.format(deleteSql, [tconst]);
 
-      // 3. Define Operation
       const ops = [
         {
           sql: formattedSql,
-          type: 'WRITE', // Triggers replication logic
+          type: 'WRITE', 
           logMsg: `[DELETE] Deleting record ${tconst}`
         }
       ];
 
-      // 4. Run Transaction
       const txnResult = await runTransaction(
         db,
-        isolation || "READ COMMITTED",
+        isolation || "REPEATABLE READ",
         ops,
-        "node1", // Source is Node 1
+        "node1", 
         replicator
       );
 
-      // 5. Response
       res.json(normalizeLogs(checkTxnSuccess(txnResult)));
 
     } catch (err) {
